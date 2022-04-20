@@ -33,6 +33,10 @@ type State struct {
 	orphanPackets float64
 }
 
+var (
+	snis map[string]*metrics.SNI
+)
+
 // NewNetworkDataSource creates a new network data source based on
 // eBPF that loads the socket filtering program on the given network
 // interface and sets the program according to the given CIDRs and
@@ -131,9 +135,6 @@ func (s *NetworkDataSource) TrackConnections(ctx context.Context, wg *sync.WaitG
 	var val C.struct_tuple_data_t
 	var currentTickerClock uint64
 
-	// Set of encountered SNIs, in either of the 2 maps
-	sniSet := map[string]struct{}{}
-
 	// keep track of failed second between ticks for each SNI in order to
 	// carry over failed seconds during inactive seconds.
 	previousFailedSecond := map[string]bool{}
@@ -142,6 +143,8 @@ func (s *NetworkDataSource) TrackConnections(ctx context.Context, wg *sync.WaitG
 	for {
 		select {
 		case <-ticks:
+			// Set of encountered SNIs, in either of the 2 maps
+			sniSet := map[string]struct{}{}
 			// oldConnections are the connections that were initiated C.STATS_SECONDS_COUNT seconds ago
 			oldConnections := make(map[C.struct_tuple_key_t]*tupleData)
 			connections := s.ebpfConfig.connectionMap.Iterate()
@@ -218,6 +221,8 @@ func (s *NetworkDataSource) TrackConnections(ctx context.Context, wg *sync.WaitG
 				incs <- inc
 			}
 
+			deleteExpiredSNIs()
+
 			// Update the counter to new value.
 			currentTickerClock++
 			if err := s.ebpfConfig.tickerClockMap.Put(uint32(0), currentTickerClock); err != nil {
@@ -226,6 +231,14 @@ func (s *NetworkDataSource) TrackConnections(ctx context.Context, wg *sync.WaitG
 			}
 		case <-done:
 			return
+		}
+	}
+}
+
+func deleteExpiredSNIs() {
+	for name, sni := range snis {
+		if sni.Expired {
+			delete(snis, name)
 		}
 	}
 }
@@ -281,7 +294,13 @@ func (s *State) accountForConnections(
 	if sni == "" {
 		klog.Error("SNI is empty")
 	}
-	inc := &metrics.Inc{AllSeconds: 1, OrphanPackets: s.orphanPackets, SNI: sni} // TODO: check: orphan packets should be counter -> do not set to current value
+	if _, ok := snis[sni]; !ok {
+		snis[sni] = metrics.NewSNI(sni)
+		go snis[sni].StartTTL(&metrics.RealTimer{
+			Timer: time.NewTimer(metrics.TTL),
+		})
+	}
+	inc := &metrics.Inc{AllSeconds: 1, OrphanPackets: s.orphanPackets, SNI: snis[sni]} // TODO: check: orphan packets should be counter -> do not set to current value
 
 	klog.Infof("sni: %s, connections: %d", sni, len(staleConnMapInfo))
 	var activeSecond, activeFailedSecond bool
